@@ -1,43 +1,38 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Dan Koe 每日内容推送到飞书 - GitHub 持久化版本
-用法: python3 feishu_pusher_complete.py <webhook_url> push-today
-
-工作流程：
-1. 从 GitHub 仓库拉取最新数据（git pull）
-2. 读取今天的日历条目和改编文章
-3. 推送到飞书
-4. 将推送记录写回 GitHub（git commit & push）
+Dan Koe Daily Pusher - GitHub 持久化 + AI 生成版本
+每日定时触发：
+  1. git pull 拉取最新主题计划
+  2. 根据日期计算今天是第几天
+  3. 调用 OpenAI 实时生成文章
+  4. 推送到飞书
+  5. 日志 git commit & push 回 GitHub
 """
 
-import sys
 import json
 import os
 import subprocess
+import sys
+import datetime
 import requests
-from datetime import datetime
 import pytz
 
-# 仓库信息
-REPO_NAME = "zhenxishuai/dan-koe-daily"
-REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+# ─── 配置 ────────────────────────────────────────────────────────────────────
+FEISHU_WEBHOOK = os.environ.get(
+    "FEISHU_WEBHOOK",
+    "https://open.feishu.cn/open-apis/bot/v2/hook/6d5e9d1c-a7f4-4b2e-8c3f-1d2e3f4a5b6c"
+)
+GITHUB_REPO = "zhenxishuai/dan-koe-daily"
+REPO_DIR    = os.path.dirname(os.path.abspath(__file__))
+TOPIC_FILE  = os.path.join(REPO_DIR, "topic_plan.json")
+LOG_FILE    = os.path.join(REPO_DIR, "push_log.json")
+START_DATE  = datetime.date(2026, 2, 20)   # Day 1 对应的日期
+TIMEZONE    = "Asia/Shanghai"
 
-# 文件路径
-CALENDAR_FILE = os.path.join(REPO_DIR, "180day_calendar.json")
-CONTENT_FILE = os.path.join(REPO_DIR, "adapted_content.json")
-LOG_FILE = os.path.join(REPO_DIR, "push_log.json")
+# ─── 工具函数 ─────────────────────────────────────────────────────────────────
 
-
-def get_today_date():
-    """获取今天的日期（GMT+8）"""
-    tz = pytz.timezone("Asia/Shanghai")
-    now = datetime.now(tz)
-    return now.strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d %H:%M:%S")
-
-
-def run_cmd(cmd, cwd=None):
-    """执行 shell 命令，返回 (returncode, stdout, stderr)"""
+def run(cmd, cwd=None):
     result = subprocess.run(
         cmd, shell=True, capture_output=True, text=True, cwd=cwd or REPO_DIR
     )
@@ -45,212 +40,260 @@ def run_cmd(cmd, cwd=None):
 
 
 def ensure_repo():
-    """确保仓库存在并是最新状态"""
-    # 检查是否在 git 仓库中
-    code, out, err = run_cmd("git status")
-    if code != 0:
-        print(f"当前目录不是 git 仓库，尝试克隆...")
+    """确保本地仓库存在且是最新的"""
+    if not os.path.isdir(os.path.join(REPO_DIR, ".git")):
+        print("📥 克隆仓库...")
         parent = os.path.dirname(REPO_DIR)
-        repo_basename = os.path.basename(REPO_DIR)
-        code, out, err = run_cmd(
-            f"gh repo clone {REPO_NAME} {repo_basename}", cwd=parent
-        )
+        name   = os.path.basename(REPO_DIR)
+        code, out, err = run(f"gh repo clone {GITHUB_REPO} {name}", cwd=parent)
         if code != 0:
-            print(f"克隆失败: {err}")
-            return False
-        # 配置 git 用户
-        run_cmd("git config user.email 'bot@dankoe.local'")
-        run_cmd("git config user.name 'Dan Koe Bot'")
-
-    # 拉取最新内容
-    print("从 GitHub 拉取最新数据...")
-    code, out, err = run_cmd("git pull origin main 2>&1 || git pull origin master 2>&1")
-    if code != 0:
-        # 可能是空仓库或网络问题，继续使用本地文件
-        print(f"git pull 提示: {err or out}（继续使用本地文件）")
+            raise RuntimeError(f"克隆失败: {err}")
     else:
-        print(f"git pull: {out or '已是最新'}")
-    return True
+        print("🔄 拉取最新内容...")
+        run("git pull --rebase 2>&1")
+
+    run('git config user.email "manus-bot@daily.push"')
+    run('git config user.name "Manus Daily Bot"')
 
 
-def load_json(filepath):
-    """加载 JSON 文件"""
-    with open(filepath, "r", encoding="utf-8") as f:
-        return json.load(f)
+def get_today_info():
+    """返回 (today_date, day_number, today_str)"""
+    tz    = pytz.timezone(TIMEZONE)
+    today = datetime.datetime.now(tz).date()
+    day_n = (today - START_DATE).days + 1
+    return today, day_n, today.strftime("%Y-%m-%d")
 
 
-def save_json(filepath, data):
-    """保存 JSON 文件"""
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-def get_today_calendar_entry(calendar, today_date):
-    """从日历中找到今天的条目"""
-    for entry in calendar:
-        if entry.get("date") == today_date:
-            return entry
+def get_topic(day_number):
+    """从 topic_plan.json 获取今天的主题"""
+    with open(TOPIC_FILE, "r", encoding="utf-8") as f:
+        topics = json.load(f)
+    for t in topics:
+        if t["day"] == day_number:
+            return t
     return None
 
 
-def format_message(calendar_entry, content_entry):
-    """格式化飞书消息内容（纯文本，避免 Markdown 渲染问题）"""
-    day = calendar_entry.get("day", "?")
-    date = calendar_entry.get("date", "")
-    theme = calendar_entry.get("theme", "")
-    key_insight = calendar_entry.get("key_insight", "")
+def already_pushed(today_str):
+    """检查今天是否已推送"""
+    if not os.path.exists(LOG_FILE):
+        return False
+    with open(LOG_FILE, "r", encoding="utf-8") as f:
+        logs = json.load(f)
+    return any(e.get("date") == today_str for e in logs)
 
-    title = content_entry.get("title", "")
-    subtitle = content_entry.get("subtitle", "")
-    body = content_entry.get("body", "")
-    reflection = content_entry.get("reflection", "")
-    action = content_entry.get("action", "")
 
+def generate_article(topic):
+    """调用 OpenAI 生成当日文章，返回格式化文本"""
+    try:
+        from openai import OpenAI
+        client = OpenAI()
+    except Exception as e:
+        print(f"⚠️  OpenAI 初始化失败: {e}")
+        return None
+
+    prompt = f"""你是一位有深度的中文内容创作者，为一个每日成长洞察专栏写文章。
+
+今日信息：
+- 主题：{topic['topic']}
+- 核心角度：{topic['angle']}
+- 入坑种子（参考方向，不要直接照搬）：{topic['hook_seed']}
+
+写作要求：
+1. 开头写一段60-80字的入坑引导，用一个让人有共鸣的真实场景开头，让读者觉得"这说的就是我"，想继续往下看。
+2. 正文900-1100字，必须包含一个具体的例子或小故事让观点落地，不能全是道理。
+3. 今日反思：一个让人真的会停下来想的问题，不超过50字。
+4. 今日行动：一个今天就能做的具体行动，不超过80字，要有操作性。
+
+风格要求（非常重要）：
+- 彻底去掉 AI 味：不用"此外、至关重要、深入探讨、格局、织锦、见证、不仅……而且……、值得注意的是"等词
+- 不提任何具体人名
+- 口语化，有温度，像真实的人在说话，可以有情绪
+- 混合长短句，节奏自然
+- 用具体细节代替抽象概括
+- 不用加粗标题，不用列表，用自然的段落
+- 读完要让人想动起来，而不是点头称是然后关掉
+
+输出格式（严格按照，不要有其他内容）：
+
+【入坑】
+（入坑引导段）
+
+【正文】
+（正文，段落之间空一行）
+
+【今日反思】
+（反思问题）
+
+【今日行动】
+（行动建议）"""
+
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.85,
+            max_tokens=2200
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"⚠️  OpenAI 调用失败: {e}")
+        return None
+
+
+def parse_article(article_text):
+    """解析文章各部分"""
+    parts = {"入坑": [], "正文": [], "今日反思": [], "今日行动": []}
+    current = None
+    for line in article_text.split("\n"):
+        s = line.strip()
+        if s == "【入坑】":
+            current = "入坑"
+        elif s == "【正文】":
+            current = "正文"
+        elif s == "【今日反思】":
+            current = "今日反思"
+        elif s == "【今日行动】":
+            current = "今日行动"
+        elif current is not None:
+            parts[current].append(line)
+    return {k: "\n".join(v).strip() for k, v in parts.items()}
+
+
+def build_feishu_message(day_number, topic, article_text, today_str):
+    """构建飞书纯文本消息"""
     lines = []
-    lines.append(f"Day {day} | {date}")
-    lines.append(f"主题：{theme}")
+    lines.append(f"Day {day_number}  |  {today_str}")
+    lines.append(f"今日主题：{topic['topic']}")
+    lines.append("─" * 28)
     lines.append("")
-    lines.append(f"【{title}】")
-    lines.append(f"{subtitle}")
-    lines.append("")
-    lines.append(body)
-    lines.append("")
-    lines.append("─" * 20)
-    lines.append("")
-    lines.append(f"核心洞察：{key_insight}")
-    lines.append("")
-    lines.append(f"今日反思：{reflection}")
-    lines.append("")
-    lines.append(f"行动建议：{action}")
-    lines.append("")
-    lines.append("─" * 20)
-    lines.append("Dan Koe 深度洞察 | 每日一篇")
+
+    if article_text:
+        p = parse_article(article_text)
+
+        if p["入坑"]:
+            lines.append(p["入坑"])
+            lines.append("")
+
+        if p["正文"]:
+            lines.append(p["正文"])
+            lines.append("")
+
+        lines.append("─" * 28)
+        lines.append("")
+
+        if p["今日反思"]:
+            lines.append("今日反思")
+            lines.append(p["今日反思"])
+            lines.append("")
+
+        if p["今日行动"]:
+            lines.append("今日行动")
+            lines.append(p["今日行动"])
+    else:
+        # 备用内容（AI 失败时）
+        lines.append(f"今天聊一个问题：{topic['hook_seed']}")
+        lines.append("")
+        lines.append(topic["angle"])
 
     return "\n".join(lines)
 
 
-def push_to_feishu(webhook_url, message_text):
-    """通过 Webhook 推送消息到飞书"""
-    payload = {
-        "msg_type": "text",
-        "content": {"text": message_text}
-    }
-    headers = {"Content-Type": "application/json"}
-    response = requests.post(webhook_url, json=payload, headers=headers, timeout=15)
-    return response.status_code, response.json()
+def push_feishu(message_text):
+    """推送到飞书 Webhook"""
+    payload = {"msg_type": "text", "content": {"text": message_text}}
+    resp = requests.post(FEISHU_WEBHOOK, json=payload, timeout=15)
+    resp.raise_for_status()
+    result = resp.json()
+    if result.get("code") != 0:
+        raise RuntimeError(f"飞书返回错误: {result}")
+    return result
 
 
-def load_push_log():
-    """加载推送日志"""
+def save_log(today_str, day_number, topic, status, msg_len):
+    """追加推送日志"""
+    logs = []
     if os.path.exists(LOG_FILE):
-        return load_json(LOG_FILE)
-    return []
+        with open(LOG_FILE, "r", encoding="utf-8") as f:
+            logs = json.load(f)
+    tz = pytz.timezone(TIMEZONE)
+    logs.append({
+        "date":           today_str,
+        "day":            day_number,
+        "topic":          topic["topic"],
+        "status":         status,
+        "message_length": msg_len,
+        "pushed_at":      datetime.datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+    })
+    with open(LOG_FILE, "w", encoding="utf-8") as f:
+        json.dump(logs, f, ensure_ascii=False, indent=2)
 
 
-def append_push_log(log_entry):
-    """追加推送记录到日志"""
-    logs = load_push_log()
-    logs.append(log_entry)
-    save_json(LOG_FILE, logs)
-
-
-def commit_and_push_log(today_date):
-    """将更新后的日志提交并推送到 GitHub"""
-    print("将推送日志同步到 GitHub...")
-    run_cmd("git add push_log.json")
-    code, out, err = run_cmd(f'git commit -m "log: push {today_date}"')
+def sync_to_github(today_str, day_number):
+    """将日志提交并推送到 GitHub"""
+    run("git add push_log.json")
+    code, out, err = run(f'git commit -m "log: Day {day_number} pushed on {today_str}"')
     if code != 0:
-        print(f"git commit: {err or out}")
-        return False
-    code, out, err = run_cmd("git push origin main 2>&1 || git push origin master 2>&1")
+        print(f"  git commit: {err or out}")
+        return
+    code, out, err = run("git push 2>&1")
     if code != 0:
-        # 尝试设置上游分支
-        code, out, err = run_cmd("git push --set-upstream origin main 2>&1 || git push --set-upstream origin master 2>&1")
-    if code == 0:
-        print(f"日志已同步到 GitHub: {out or '成功'}")
-        return True
-    else:
-        print(f"git push 失败: {err}")
-        return False
+        run("git push --set-upstream origin main 2>&1")
+    print("✅ 日志已同步到 GitHub")
 
+
+# ─── 主流程 ───────────────────────────────────────────────────────────────────
 
 def main():
-    if len(sys.argv) < 3:
-        print("用法: python3 feishu_pusher_complete.py <webhook_url> push-today")
-        sys.exit(1)
+    print("=" * 50)
+    print("Dan Koe Daily Pusher 启动")
 
-    webhook_url = sys.argv[1]
-    command = sys.argv[2]
-
-    if command != "push-today":
-        print(f"未知命令: {command}，仅支持 push-today")
-        sys.exit(1)
-
-    today_date, now_str = get_today_date()
-    print(f"[{now_str}] 开始执行每日推送，日期：{today_date}")
-
-    # 步骤 1：确保仓库最新
+    # 1. 确保仓库最新
     ensure_repo()
 
-    # 步骤 2：加载日历
-    print("加载 180day_calendar.json ...")
-    calendar = load_json(CALENDAR_FILE)
+    # 2. 计算今天
+    today, day_number, today_str = get_today_info()
+    print(f"📅 今天 {today_str}，Day {day_number}")
 
-    calendar_entry = get_today_calendar_entry(calendar, today_date)
-    if not calendar_entry:
-        print(f"未找到 {today_date} 的日历条目，跳过推送。")
-        sys.exit(0)
+    # 3. 范围检查
+    if day_number < 1 or day_number > 180:
+        print(f"⚠️  Day {day_number} 超出范围，跳过")
+        return
 
-    print(f"找到今日条目：Day {calendar_entry['day']} - {calendar_entry['theme']}")
+    # 4. 重复检查
+    if already_pushed(today_str):
+        print(f"✅ 今天已推送过，跳过")
+        return
 
-    # 步骤 3：加载改编内容
-    print("加载 adapted_content.json ...")
-    adapted = load_json(CONTENT_FILE)
+    # 5. 获取主题
+    topic = get_topic(day_number)
+    if not topic:
+        print(f"⚠️  找不到 Day {day_number} 的主题")
+        return
+    print(f"📝 主题：{topic['topic']}")
 
-    content_id = calendar_entry.get("content_id")
-    content_entry = adapted.get(content_id)
-    if not content_entry:
-        print(f"未找到 content_id={content_id} 的改编内容，跳过推送。")
-        sys.exit(0)
+    # 6. 生成文章
+    print("🤖 生成文章中...")
+    article_text = generate_article(topic)
+    print(f"✅ 文章生成完成" if article_text else "⚠️  文章生成失败，使用备用内容")
 
-    print(f"找到改编文章：{content_entry['title']}")
+    # 7. 构建消息
+    message = build_feishu_message(day_number, topic, article_text, today_str)
+    print(f"📨 消息长度：{len(message)} 字符")
 
-    # 步骤 4：格式化并推送
-    message_text = format_message(calendar_entry, content_entry)
-    print(f"消息长度：{len(message_text)} 字符")
-    print("推送到飞书 Webhook ...")
-    status_code, resp_json = push_to_feishu(webhook_url, message_text)
+    # 8. 推送飞书
+    print("📤 推送飞书...")
+    result = push_feishu(message)
+    print(f"✅ 飞书推送成功：{result}")
 
-    if status_code == 200 and resp_json.get("code") == 0:
-        print(f"推送成功！飞书响应：{resp_json}")
-        success = True
-        error_msg = None
-    else:
-        print(f"推送失败！HTTP {status_code}，飞书响应：{resp_json}")
-        success = False
-        error_msg = str(resp_json)
+    # 9. 记录日志
+    save_log(today_str, day_number, topic, "success", len(message))
 
-    # 步骤 5：记录日志并同步到 GitHub
-    log_entry = {
-        "timestamp": now_str,
-        "date": today_date,
-        "day": calendar_entry.get("day"),
-        "theme": calendar_entry.get("theme"),
-        "title": content_entry.get("title"),
-        "content_id": content_id,
-        "success": success,
-        "http_status": status_code,
-        "feishu_response": resp_json,
-        "error": error_msg
-    }
-    append_push_log(log_entry)
-    print("推送记录已写入 push_log.json")
+    # 10. 同步 GitHub
+    sync_to_github(today_str, day_number)
 
-    # 同步日志到 GitHub
-    commit_and_push_log(today_date)
-
-    if not success:
-        sys.exit(1)
+    print(f"✅ Day {day_number} 完成！")
+    print("=" * 50)
 
 
 if __name__ == "__main__":
