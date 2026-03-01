@@ -19,10 +19,7 @@ import requests
 import pytz
 
 # ─── 配置 ────────────────────────────────────────────────────────────────────
-FEISHU_WEBHOOK = os.environ.get(
-    "FEISHU_WEBHOOK",
-    "https://open.feishu.cn/open-apis/bot/v2/hook/6d5e9d1c-a7f4-4b2e-8c3f-1d2e3f4a5b6c"
-)
+FEISHU_WEBHOOK = os.environ.get("FEISHU_WEBHOOK")
 GITHUB_REPO = "zhenxishuai/dan-koe-daily"
 REPO_DIR    = os.path.dirname(os.path.abspath(__file__))
 TOPIC_FILE  = os.path.join(REPO_DIR, "topic_plan.json")
